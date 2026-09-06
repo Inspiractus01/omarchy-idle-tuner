@@ -10,6 +10,12 @@
 #   omarchy-idle-tuner set screensaver <seconds>
 #   omarchy-idle-tuner set lock <seconds>
 #   omarchy-idle-tuner set suspend <seconds|off>
+#
+# Suspend-after-idle is kept in sync with Omarchy's own Stay Awake toggle: a
+# path unit watches ~/.local/state/omarchy/indicators/stay-awake and calls
+# 'sync-awake' (below) on every change, stopping/starting the suspend service
+# accordingly -- not an internal detail, this is the whole point: the two are
+# meant to be called only from that path unit, not run by hand.
 
 set -euo pipefail
 
@@ -19,6 +25,10 @@ HYPRIDLE_SUSPEND_CONF="$HOME/.config/hypr/hypridle-suspend.conf"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 SUSPEND_UNIT="$SYSTEMD_USER_DIR/omarchy-idle-suspend.service"
 SUSPEND_SERVICE_NAME="omarchy-idle-suspend.service"
+INDICATORS_DIR="$HOME/.local/state/omarchy/indicators"
+STAY_AWAKE_FILE="$INDICATORS_DIR/stay-awake"
+AWAKE_WATCH_PATH_UNIT="$SYSTEMD_USER_DIR/omarchy-idle-suspend-awake-watch.path"
+AWAKE_WATCH_SERVICE_UNIT="$SYSTEMD_USER_DIR/omarchy-idle-suspend-awake-watch.service"
 
 [[ -f $SUSPEND_CONF ]] || printf 'SUSPEND_SECONDS=0\n' > "$SUSPEND_CONF"
 # shellcheck disable=SC1090
@@ -77,8 +87,56 @@ apply_suspend() {
     return
   fi
   regenerate_hypridle_suspend
-  systemctl --user enable --now "$SUSPEND_SERVICE_NAME" >/dev/null
-  systemctl --user restart "$SUSPEND_SERVICE_NAME"
+  systemctl --user enable "$SUSPEND_SERVICE_NAME" >/dev/null
+  ensure_awake_watch
+  sync_awake
+}
+
+# Ties suspend-after-idle to Omarchy's own built-in "Stay Awake" toggle (the
+# same one the bar indicator and idle lock/screensaver already respect), so
+# the two move as one system instead of suspend running on its own clock
+# regardless of what the user told the rest of the desktop. Called on every
+# change to that toggle (via the path watcher below) and whenever the suspend
+# timeout itself changes.
+sync_awake() {
+  if [[ $SUSPEND_SECONDS -le 0 ]]; then
+    systemctl --user stop "$SUSPEND_SERVICE_NAME" 2>/dev/null || true
+    return
+  fi
+  if [[ -f $STAY_AWAKE_FILE ]]; then
+    systemctl --user stop "$SUSPEND_SERVICE_NAME" 2>/dev/null || true
+  else
+    systemctl --user start "$SUSPEND_SERVICE_NAME" 2>/dev/null || true
+  fi
+}
+
+ensure_awake_watch() {
+  mkdir -p "$SYSTEMD_USER_DIR" "$INDICATORS_DIR"
+  if [[ ! -f $AWAKE_WATCH_SERVICE_UNIT ]]; then
+    cat > "$AWAKE_WATCH_SERVICE_UNIT" <<EOF
+[Unit]
+Description=Sync suspend-after-idle with the Stay Awake toggle (Omarchy idle tuner)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/omarchy-idle-tuner sync-awake
+EOF
+  fi
+  if [[ ! -f $AWAKE_WATCH_PATH_UNIT ]]; then
+    cat > "$AWAKE_WATCH_PATH_UNIT" <<EOF
+[Unit]
+Description=Watch the Stay Awake toggle for suspend-after-idle (Omarchy idle tuner)
+
+[Path]
+PathModified=%h/.local/state/omarchy/indicators
+Unit=omarchy-idle-suspend-awake-watch.service
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+  fi
+  systemctl --user enable --now omarchy-idle-suspend-awake-watch.path >/dev/null
 }
 
 edit_shell_json() {
@@ -91,6 +149,9 @@ edit_shell_json() {
 }
 
 case "${1:-}" in
+  sync-awake)
+    sync_awake
+    ;;
   get)
     screensaver=$(jq -r '.idle.screensaver // 150' "$SHELL_JSON")
     lock=$(jq -r '.idle.lock // 300' "$SHELL_JSON")
