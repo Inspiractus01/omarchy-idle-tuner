@@ -1,0 +1,129 @@
+#!/bin/bash
+# Idle timing control: screensaver + lock (stored in Omarchy shell.json,
+# same fields OmaSettings uses) plus suspend-after-idle (a separate,
+# self-owned hypridle instance + systemd --user service, since the shell
+# has no native suspend-on-idle concept and the kbd-backlight hypridle
+# instance gets fully regenerated/overwritten by omarchy-kbd-backlight).
+#
+# Usage:
+#   omarchy-idle-tuner get
+#   omarchy-idle-tuner set screensaver <seconds>
+#   omarchy-idle-tuner set lock <seconds>
+#   omarchy-idle-tuner set suspend <seconds|off>
+
+set -euo pipefail
+
+SHELL_JSON="$HOME/.config/omarchy/shell.json"
+SUSPEND_CONF="$HOME/.config/omarchy/idle-suspend.conf"
+HYPRIDLE_SUSPEND_CONF="$HOME/.config/hypr/hypridle-suspend.conf"
+SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+SUSPEND_UNIT="$SYSTEMD_USER_DIR/omarchy-idle-suspend.service"
+SUSPEND_SERVICE_NAME="omarchy-idle-suspend.service"
+
+[[ -f $SUSPEND_CONF ]] || printf 'SUSPEND_SECONDS=0\n' > "$SUSPEND_CONF"
+# shellcheck disable=SC1090
+source "$SUSPEND_CONF"
+SUSPEND_SECONDS="${SUSPEND_SECONDS:-0}"
+
+ensure_unit_installed() {
+  mkdir -p "$SYSTEMD_USER_DIR"
+  if [[ ! -f $SUSPEND_UNIT ]]; then
+    cat > "$SUSPEND_UNIT" <<EOF
+[Unit]
+Description=Suspend after idle (Omarchy idle tuner)
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/hypridle -c %h/.config/hypr/hypridle-suspend.conf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+    systemctl --user daemon-reload
+  fi
+}
+
+save_suspend_conf() {
+  printf 'SUSPEND_SECONDS=%s\n' "$SUSPEND_SECONDS" > "$SUSPEND_CONF"
+}
+
+regenerate_hypridle_suspend() {
+  mkdir -p "$(dirname "$HYPRIDLE_SUSPEND_CONF")"
+  cat > "$HYPRIDLE_SUSPEND_CONF" <<EOF
+# Suspend-after-idle. Managed by omarchy-idle-tuner -- edit via
+# 'omarchy-idle-tuner set suspend <seconds|off>' rather than by hand; this
+# file gets regenerated. Kept as its own hypridle instance/service, fully
+# separate from the keyboard-backlight one, so it can't be silently wiped
+# by omarchy-kbd-backlight regenerating its own config.
+#
+# No lock_cmd/before_sleep_cmd here: systemd-logind's PrepareForSleep hook
+# (omarchy-sleep-lock.service) already locks the session before ANY
+# suspend, regardless of what triggered it.
+listener {
+  timeout = $SUSPEND_SECONDS
+  on-timeout = systemctl suspend
+}
+EOF
+}
+
+apply_suspend() {
+  ensure_unit_installed
+  if [[ $SUSPEND_SECONDS -le 0 ]]; then
+    systemctl --user stop "$SUSPEND_SERVICE_NAME" 2>/dev/null || true
+    systemctl --user disable "$SUSPEND_SERVICE_NAME" 2>/dev/null || true
+    return
+  fi
+  regenerate_hypridle_suspend
+  systemctl --user enable --now "$SUSPEND_SERVICE_NAME" >/dev/null
+  systemctl --user restart "$SUSPEND_SERVICE_NAME"
+}
+
+edit_shell_json() {
+  # All args except the last are extra jq flags/params (e.g. --argjson v 60);
+  # the last arg is the filter itself.
+  local tmp
+  tmp="$(mktemp "${SHELL_JSON}.XXXXXX")"
+  jq "$@" "$SHELL_JSON" > "$tmp"
+  mv "$tmp" "$SHELL_JSON"
+}
+
+case "${1:-}" in
+  get)
+    screensaver=$(jq -r '.idle.screensaver // 150' "$SHELL_JSON")
+    lock=$(jq -r '.idle.lock // 300' "$SHELL_JSON")
+    printf 'SCREENSAVER=%s\nLOCK=%s\nSUSPEND=%s\n' "$screensaver" "$lock" "$SUSPEND_SECONDS"
+    ;;
+  set)
+    case "${2:-}" in
+      screensaver)
+        edit_shell_json --argjson v "$3" '.idle = ((.idle // {}) | .screensaver = $v)'
+        echo "$3"
+        ;;
+      lock)
+        edit_shell_json --argjson v "$3" '.idle = ((.idle // {}) | .lock = $v)'
+        echo "$3"
+        ;;
+      suspend)
+        if [[ $3 == off ]]; then
+          SUSPEND_SECONDS=0
+        else
+          SUSPEND_SECONDS="$3"
+        fi
+        save_suspend_conf
+        apply_suspend
+        echo "$SUSPEND_SECONDS"
+        ;;
+      *)
+        echo "usage: omarchy-idle-tuner set {screensaver|lock|suspend} <value>" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    echo "usage: omarchy-idle-tuner {get|set <field> <value>}" >&2
+    exit 1
+    ;;
+esac
